@@ -1,0 +1,149 @@
+from playwright.sync_api import sync_playwright, Playwright
+import csv
+import logging
+import re
+import json
+import time
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+def clean_phone(phone_raw):
+    # Remove all non-digit characters, keep leading + if present
+    phone_digits = re.sub(r'\D', '', phone_raw)
+    if phone_digits.startswith('1'):
+        return f'+{phone_digits}'
+    elif phone_digits:
+        return f'+1{phone_digits}'
+    return ''
+
+def extract_address(addr):
+    if not isinstance(addr, dict):
+        return ""
+    parts = [
+        addr.get("streetAddress", ""),
+        addr.get("addressLocality", ""),
+        addr.get("addressRegion", ""),
+        addr.get("postalCode", ""),
+    ]
+    return ", ".join(part for part in parts if part)
+
+def extract_principal_contact(data):
+    employees = data.get("employee", [])
+    if isinstance(employees, list) and employees:
+        emp = employees[0]
+        name_parts = [
+            emp.get("honorificPrefix", ""),
+            emp.get("givenName", ""),
+            emp.get("additionalName", ""),
+            emp.get("familyName", "")
+        ]
+        name_str = " ".join(p for p in name_parts if p).strip()
+        job_title = emp.get("jobTitle", "").strip()
+        if name_str and job_title:
+            return f"{name_str}, {job_title}"
+        elif name_str:
+            return name_str
+        elif job_title:
+            return job_title
+    return ""
+
+def run(playwright: Playwright):
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    base_url = (
+        "https://www.bbb.org/search?filter_category=60548-100&filter_category=60142-000&filter_ratings=A&filter_accreditation=1&find_country=USA&find_text=Medical+Billing&page={page_num}&touched=15"
+    )
+    seen_profiles = set()
+    all_results = []
+    for page_num in range(1, 3): # Adjust the range as needed
+        url = base_url.format(page_num=page_num)
+        page.goto(url)
+        logging.info(f"Scraping page {page_num}: {url}")
+        try:
+            page.wait_for_selector("div.card.result-card", timeout=5000)
+        except Exception as e:
+            logging.warning(f"Timeout waiting for business cards on page {page_num}: {e}")
+            continue
+        business_cards = page.locator("div.card.result-card")
+        count = business_cards.count()
+        logging.info(f"Found {count} business cards on page {page_num}")
+        if count == 0:
+            break  # No more results
+        for i in range(count):
+            card = business_cards.nth(i)
+            name_el = card.locator("h3.result-business-name a")
+            name = name_el.inner_text().strip() if name_el.count() > 0 else ""
+            href = name_el.get_attribute("href") if name_el.count() > 0 else ""
+            profile_url = href if href and href.startswith("http") else f"https://www.bbb.org{href}" if href else ""
+            if not profile_url or profile_url in seen_profiles:
+                continue  # Deduplicate
+            seen_profiles.add(profile_url)
+            # Respectful scraping:
+            time.sleep(2)
+            phone = ""
+            accredited = "No"
+            try:
+                seal_img = card.locator("img[alt='Accredited Business']")
+                if seal_img.count() > 0:
+                    accredited = "Yes"
+            except:
+                pass
+            principal_contact = ""
+            address = ""
+            # Extracting contact info from the profile page for accuracy
+            profile_page = context.new_page()
+            profile_page.goto(profile_url)
+            try:
+                jsonld_script = profile_page.locator("script[type='application/ld+json']").first
+                jsonld_text = jsonld_script.inner_text()
+                data = json.loads(jsonld_text)
+                if isinstance(data, list):
+                    data = data[0]
+                name = data.get("name", name)
+                phone = clean_phone(data.get("telephone", phone))
+                address = extract_address(data.get("address", {}))
+                principal_contact = extract_principal_contact(data)
+            except Exception as e:
+                logging.warning(f"JSON-LD failed for {name}: {e}")
+            if not address:
+                try:
+                    addr_lines = card.locator("div.bpr-overview-address p.bds-body")
+                    parts = [addr_lines.nth(j).inner_text().strip() for j in range(addr_lines.count())]
+                    address = ", ".join(part for part in parts if part)
+                except Exception as e:
+                    logging.warning(f"Fallback address not found for {name}: {e}")
+            profile_page.close()
+            result = {
+                "Name": name,
+                "Profile URL": profile_url,
+                "Phone": phone,
+                "Principal Contact": principal_contact,
+                "Address": address,
+                "Accredited": accredited
+            }
+            all_results.append(result)
+            logging.info(
+                f"Business {len(all_results)} (page {page_num}):\n"
+                f"Name: {name}\n"
+                f"Profile URL: {profile_url}\n"
+                f"Phone: {phone}\n"
+                f"Principal Contact: {principal_contact}\n"
+                f"Address: {address}\n"
+                f"Accredited: {accredited}\n"
+            )
+    context.close()
+    browser.close()
+
+    # Export to CSV
+    csv_file = "medical_billing_companies.csv"
+    fieldnames = ["Name", "Profile URL", "Phone", "Principal Contact", "Address", "Accredited"]
+    with open(csv_file, mode="w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_results:
+            writer.writerow(row)
+    logging.info(f"Exported {len(all_results)} businesses to {csv_file}")
+
+
+with sync_playwright() as playwright:
+    run(playwright)
