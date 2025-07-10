@@ -102,13 +102,13 @@ async def scrape_bbb():
 
         print(f"\n✅ Extracted and saved {len(businesses)} businesses to medical_billing_companies.csv")
 
-        """
+        
         with open("medical_billing_companies.csv", mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=Business.model_fields.keys())
             writer.writeheader()
             for b in businesses:
                 writer.writerow(b.model_dump())  
-        """
+        
 
     finally:
         print("\n🔒 Closing Stagehand session...")
